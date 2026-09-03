@@ -1,0 +1,38 @@
+logLevel: info
+
+# MediaMTX delegates every publish/read decision to the C# API.
+authMethod: http
+authHTTPAddress: http://api:3000/api/media-auth?key=local-media-auth-key
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+# TCP avoids RTSP port-mapping issues inside Docker.
+rtspTransports: [tcp]
+
+hls: true
+hlsAddress: :8888
+hlsAllowOrigins: ["*"]
+
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: ["*"]
+webrtcLocalUDPAddress: :8189
+webrtcAdditionalHosts: [127.0.0.1]
+
+# These protocols are not part of this browser-first stack.
+srt: false
+moq: false
+
+pathDefaults:
+  source: publisher
+  record: false
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordSegmentDuration: 1h
+  recordDeleteAfter: 7d
+
+# Only paths that follow the same room-ID rules as the C# API are accepted.
+paths:
+  "~^[A-Za-z0-9-]{3,64}$":

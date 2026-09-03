@@ -1,48 +1,140 @@
-# Streaming API
+# Streaming API with MediaMTX
 
-An ASP.NET Core SignalR signaling server for one WebRTC broadcaster and multiple viewers.
-The media goes directly between browsers; the server only coordinates rooms and forwards
-offers, answers, and ICE candidates.
+This project is the control API for a one-to-many live-streaming platform.
 
-## Run locally
+- ASP.NET Core creates rooms, issues access tokens, and authorizes media access.
+- MediaMTX receives one stream from the broadcaster and distributes it to viewers.
+- SignalR is used only for optional presence updates such as viewer counts.
+- Svelte owns the recording and viewing interfaces.
+
+The C# API does not relay video bytes and does not serve HTML.
+
+## Run the complete stack
+
+Start Docker Desktop, then run:
 
 ```bash
-dotnet run
+docker compose up --build
 ```
 
-The API listens on `http://localhost:3000`. Check it with `GET /health`.
+Local services:
 
-## HTTP controller
+| Service | Address |
+| --- | --- |
+| C# API | `http://localhost:3000` |
+| MediaMTX WebRTC | `http://localhost:8889` |
+| MediaMTX HLS | `http://localhost:8888` |
+| MediaMTX WebRTC media | UDP port `8189` |
+| MediaMTX RTMP ingest | `rtmp://localhost:1935` |
+| MediaMTX RTSP | `rtsp://localhost:8554` |
 
-`StreamingController` provides the normal request-response API:
+Run only the API with `dotnet run`. Media publishing and playback require MediaMTX too.
 
-- `GET /api/streaming` describes the streaming service and SignalR endpoint.
-- `GET /api/streaming/rooms/{roomId}` reports whether a known room is live and its
-  current viewer count.
+## Create a room
 
-Live room creation, joining, and WebRTC signaling remain in `StreamingHub` because
-those operations require a persistent, two-way SignalR connection.
+```http
+POST /api/streaming/rooms
+Content-Type: application/json
 
-For a Svelte or SvelteKit client, follow [SVELTE-CLIENT.md](SVELTE-CLIENT.md).
+{
+  "roomId": "demo-room"
+}
+```
 
-## SignalR contract
+The room ID is optional. The API generates one when it is empty.
 
-Connect to `/streamingHub`, then invoke:
+Example response:
 
-- `create-room` with a room ID
-- `join-room` with a room ID
-- `offer` or `answer` with `{ target, sdp }`
-- `ice-candidate` with `{ target, candidate }`
+```json
+{
+  "roomId": "demo-room",
+  "publisherToken": "secret-publisher-token",
+  "viewerToken": "shareable-viewer-token",
+  "publishUrl": "http://localhost:8889/demo-room/whip",
+  "watchUrl": "http://localhost:8889/demo-room/whep",
+  "hlsUrl": "http://localhost:8888/demo-room/index.m3u8",
+  "sharePath": "/watch/demo-room#token=shareable-viewer-token"
+}
+```
 
-Listen for `room-created`, `joined-room`, `viewer-joined`, `viewer-left`, `offer`,
-`answer`, `ice-candidate`, `broadcaster-left`, and `streaming-error`.
+The raw tokens are returned only when the room is created. The registry keeps SHA-256
+hashes instead of the raw values.
 
-## Production scaling
+## Room endpoints
 
-The in-memory room registry is intentionally scoped to one server process. For multiple
-API instances, move room presence into a distributed store and add a SignalR backplane.
-Browser-to-browser WebRTC makes the broadcaster upload once per viewer, so use an SFU
-such as LiveKit, Janus, or mediasoup when a stream needs a large audience. Configure a
-TURN server as well; a public STUN server alone cannot connect every network topology.
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/streaming/rooms` | Create a room and its tokens |
+| `GET` | `/api/streaming/rooms/{roomId}` | Read room metadata and viewer count |
+| `DELETE` | `/api/streaming/rooms/{roomId}` | Delete a room using `X-Publisher-Token` |
+| `GET` | `/api/streaming` | Describe the service |
+| `GET` | `/health` | API health check |
 
-Replace the wildcard entry in `Cors:AllowedOrigins` before production deployment.
+Close the WHIP publisher before deleting its room. Deleting the room invalidates future
+MediaMTX requests but does not forcibly terminate a media session already in progress.
+
+## Media authorization
+
+MediaMTX sends every `publish`, `read`, and `playback` authorization request to:
+
+```text
+POST /api/media-auth
+```
+
+This is an internal callback, not a frontend endpoint.
+
+- The publisher token can publish and read its room.
+- The viewer token can only read its room.
+- Tokens cannot access a different room.
+- Unknown rooms and invalid tokens receive HTTP 401.
+
+WHIP and WHEP clients send the token with:
+
+```http
+Authorization: Bearer token-value
+```
+
+## SignalR presence
+
+Connect to `/streamingHub`, then register a viewer with:
+
+```typescript
+await connection.invoke('join-room', roomId, viewerToken);
+```
+
+Listen for:
+
+- `joined-room`
+- `viewer-count-changed`
+- `room-ended`
+- `streaming-error`
+
+SignalR no longer forwards WebRTC offers, answers, or ICE candidates. MediaMTX handles
+that work through WHIP and WHEP.
+
+## Recording
+
+Recording is configured but disabled in `mediamtx.yml`. To store streams as fragmented
+MP4 segments, change:
+
+```yaml
+pathDefaults:
+  record: true
+```
+
+Files will be written under `recordings/{roomId}` and deleted after seven days by the
+current example configuration.
+
+## Important production changes
+
+- Replace `local-media-auth-key` in both `appsettings.json` and `mediamtx.yml`.
+- Replace wildcard CORS origins in both services with the Svelte application's origin.
+- Replace `127.0.0.1` in `webrtcAdditionalHosts` with the server's public IP or DNS name.
+- Serve the API, Svelte app, and MediaMTX handshake endpoints over HTTPS.
+- Configure TURN when clients cannot reach MediaMTX UDP port `8189` directly.
+- Replace the in-memory `RoomRegistry` with a shared persistent store before running
+  multiple API instances. No database migration is included or run by this project.
+
+See [FRONTEND-VIEWER.md](FRONTEND-VIEWER.md) for the simplest viewing example,
+[SVELTE-CLIENT.md](SVELTE-CLIENT.md) for complete browser integration, and
+[Connection-Guide.md](Connection-Guide.md) for the short end-to-end explanation.

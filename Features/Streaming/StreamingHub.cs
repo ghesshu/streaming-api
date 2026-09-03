@@ -1,65 +1,37 @@
-using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.SignalR;
 
 namespace App.Features.Streaming;
 
-public sealed partial class StreamingHub(
+public sealed class StreamingHub(
     RoomRegistry roomRegistry,
     ILogger<StreamingHub> logger) : Hub
 {
-    [HubMethodName("create-room")]
-    public async Task CreateRoom(string roomId)
-    {
-        roomId = roomId?.Trim() ?? string.Empty;
-
-        if (!RoomIdPattern().IsMatch(roomId))
-        {
-            await SendError("Room IDs must contain 3 to 64 letters, numbers, or hyphens.");
-            return;
-        }
-
-        var result = roomRegistry.CreateRoom(roomId, Context.ConnectionId);
-
-        if (result == CreateRoomResult.AlreadyInRoom)
-        {
-            await SendError("This connection is already in a room.");
-            return;
-        }
-
-        if (result == CreateRoomResult.RoomAlreadyExists)
-        {
-            await SendError("That room already exists.");
-            return;
-        }
-
-        await Groups.AddToGroupAsync(Context.ConnectionId, roomId);
-
-        logger.LogInformation(
-            "Room {RoomId} created by {ConnectionId}",
-            roomId,
-            Context.ConnectionId);
-
-        await Clients.Caller.SendAsync(
-            "room-created",
-            new { roomId },
-            Context.ConnectionAborted);
-    }
-
     [HubMethodName("join-room")]
-    public async Task JoinRoom(string roomId)
+    public async Task JoinRoom(string roomId, string viewerToken)
     {
         roomId = roomId?.Trim() ?? string.Empty;
-        var result = roomRegistry.JoinRoom(roomId, Context.ConnectionId, out var broadcasterId);
+
+        var result = roomRegistry.JoinRoom(
+            roomId,
+            Context.ConnectionId,
+            viewerToken,
+            out var roomStatus);
 
         if (result == JoinRoomResult.AlreadyInRoom)
         {
-            await SendError("This connection is already in a room.");
+            await SendError("This connection is already watching a room.");
             return;
         }
 
-        if (result == JoinRoomResult.RoomNotFound || broadcasterId is null)
+        if (result == JoinRoomResult.RoomNotFound)
         {
-            await SendError("Room does not exist or has no broadcaster.");
+            await SendError("Room does not exist.");
+            return;
+        }
+
+        if (result == JoinRoomResult.InvalidToken || roomStatus is null)
+        {
+            await SendError("The viewer token is invalid.");
             return;
         }
 
@@ -70,97 +42,41 @@ public sealed partial class StreamingHub(
             Context.ConnectionId,
             roomId);
 
-        await Clients.Client(broadcasterId).SendAsync(
-            "viewer-joined",
-            new { viewerId = Context.ConnectionId },
-            Context.ConnectionAborted);
-
         await Clients.Caller.SendAsync(
             "joined-room",
-            new { roomId, broadcasterId },
+            roomStatus,
             Context.ConnectionAborted);
-    }
 
-    [HubMethodName("offer")]
-    public Task Offer(SessionDescriptionMessage message)
-    {
-        return RelayDescription("offer", message);
-    }
-
-    [HubMethodName("answer")]
-    public Task Answer(SessionDescriptionMessage message)
-    {
-        return RelayDescription("answer", message);
-    }
-
-    [HubMethodName("ice-candidate")]
-    public async Task IceCandidate(IceCandidateMessage message)
-    {
-        if (string.IsNullOrWhiteSpace(message.Target) ||
-            !roomRegistry.CanRelay(Context.ConnectionId, message.Target))
-        {
-            await SendError("The signaling target is not in your room.");
-            return;
-        }
-
-        await Clients.Client(message.Target).SendAsync(
-            "ice-candidate",
-            new
-            {
-                candidate = message.Candidate,
-                sender = Context.ConnectionId
-            },
+        await Clients.Group(roomId).SendAsync(
+            "viewer-count-changed",
+            roomStatus,
             Context.ConnectionAborted);
     }
 
     public override async Task OnConnectedAsync()
     {
-        logger.LogInformation("User connected: {ConnectionId}", Context.ConnectionId);
+        logger.LogInformation("Presence connection opened: {ConnectionId}", Context.ConnectionId);
         await base.OnConnectedAsync();
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        var result = roomRegistry.Disconnect(Context.ConnectionId);
+        var result = roomRegistry.DisconnectViewer(Context.ConnectionId);
 
         if (result is not null)
         {
-            if (result.WasBroadcaster)
-            {
-                await Clients.Group(result.RoomId).SendAsync("broadcaster-left");
-                logger.LogInformation(
-                    "Room {RoomId} deleted because its broadcaster left",
-                    result.RoomId);
-            }
-            else if (result.BroadcasterId is not null)
-            {
-                await Clients.Client(result.BroadcasterId).SendAsync(
-                    "viewer-left",
-                    new { viewerId = Context.ConnectionId });
-            }
+            await Clients.Group(result.RoomId).SendAsync(
+                "viewer-count-changed",
+                new
+                {
+                    roomId = result.RoomId,
+                    viewerCount = result.ViewerCount,
+                    isCreated = true
+                });
         }
 
-        logger.LogInformation("User disconnected: {ConnectionId}", Context.ConnectionId);
+        logger.LogInformation("Presence connection closed: {ConnectionId}", Context.ConnectionId);
         await base.OnDisconnectedAsync(exception);
-    }
-
-    private async Task RelayDescription(string eventName, SessionDescriptionMessage message)
-    {
-        if (string.IsNullOrWhiteSpace(message.Target) ||
-            !roomRegistry.CanRelay(Context.ConnectionId, message.Target))
-        {
-            await SendError("The signaling target is not in your room.");
-            return;
-        }
-
-        await Clients.Client(message.Target).SendAsync(
-            eventName,
-            new
-            {
-                sdp = message.Sdp,
-                sender = Context.ConnectionId
-            },
-            Context.ConnectionAborted);
     }
 
     private Task SendError(string message)
@@ -170,7 +86,4 @@ public sealed partial class StreamingHub(
             message,
             Context.ConnectionAborted);
     }
-
-    [GeneratedRegex("^[A-Za-z0-9-]{3,64}$", RegexOptions.CultureInvariant)]
-    private static partial Regex RoomIdPattern();
 }

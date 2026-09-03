@@ -1,13 +1,19 @@
 using App.Features.Streaming;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Options;
 
 namespace App.Controllers;
 
 [ApiController]
 [Route("api/streaming")]
-public sealed class StreamingController(RoomRegistry roomRegistry) : ControllerBase
+public sealed class StreamingController(
+    RoomRegistry roomRegistry,
+    IOptions<MediaMtxOptions> mediaMtxOptions,
+    IHubContext<StreamingHub> streamingHub) : ControllerBase
 {
-    // This endpoint describes the HTTP and real-time parts of the streaming API.
+    private readonly MediaMtxOptions mediaMtx = mediaMtxOptions.Value;
+
     [HttpGet]
     public IActionResult GetService()
     {
@@ -15,12 +21,57 @@ public sealed class StreamingController(RoomRegistry roomRegistry) : ControllerB
         {
             service = "streaming-api",
             status = "available",
-            signalRHub = "/streamingHub",
-            roomStatusEndpoint = "/api/streaming/rooms/{roomId}"
+            mediaServer = "MediaMTX",
+            createRoomEndpoint = "/api/streaming/rooms",
+            signalRHub = "/streamingHub"
         });
     }
 
-    // A Svelte client can call this before joining to check whether a room is live.
+    [HttpPost("rooms")]
+    public IActionResult CreateRoom(CreateRoomRequest request)
+    {
+        var roomId = request.RoomId?.Trim();
+
+        if (string.IsNullOrWhiteSpace(roomId))
+        {
+            var generatedId = Guid.NewGuid().ToString("N")[..12];
+            roomId = $"live-{generatedId}";
+        }
+
+        if (!RoomIdValidator.IsValid(roomId))
+        {
+            return BadRequest(new
+            {
+                message = "Room IDs must contain 3 to 64 letters, numbers, or hyphens."
+            });
+        }
+
+        if (!roomRegistry.TryCreateRoom(roomId, out var createdRoom) || createdRoom is null)
+        {
+            return Conflict(new
+            {
+                message = "That room already exists."
+            });
+        }
+
+        var webRtcBaseUrl = mediaMtx.WebRtcBaseUrl.TrimEnd('/');
+        var hlsBaseUrl = mediaMtx.HlsBaseUrl.TrimEnd('/');
+
+        var response = new CreateRoomResponse(
+            createdRoom.RoomId,
+            createdRoom.PublisherToken,
+            createdRoom.ViewerToken,
+            $"{webRtcBaseUrl}/{createdRoom.RoomId}/whip",
+            $"{webRtcBaseUrl}/{createdRoom.RoomId}/whep",
+            $"{hlsBaseUrl}/{createdRoom.RoomId}/index.m3u8",
+            $"/watch/{createdRoom.RoomId}#token={createdRoom.ViewerToken}");
+
+        return CreatedAtAction(
+            nameof(GetRoom),
+            new { roomId = createdRoom.RoomId },
+            response);
+    }
+
     [HttpGet("rooms/{roomId}")]
     public IActionResult GetRoom(string roomId)
     {
@@ -30,10 +81,31 @@ public sealed class StreamingController(RoomRegistry roomRegistry) : ControllerB
         {
             return NotFound(new
             {
-                message = "Room does not exist or is no longer live."
+                message = "Room does not exist."
             });
         }
 
         return Ok(room);
+    }
+
+    [HttpDelete("rooms/{roomId}")]
+    public async Task<IActionResult> DeleteRoom(
+        string roomId,
+        [FromHeader(Name = "X-Publisher-Token")] string publisherToken)
+    {
+        if (!roomRegistry.RemoveRoom(roomId, publisherToken))
+        {
+            return Unauthorized(new
+            {
+                message = "The room does not exist or the publisher token is invalid."
+            });
+        }
+
+        await streamingHub.Clients.Group(roomId).SendAsync(
+            "room-ended",
+            new { roomId },
+            HttpContext.RequestAborted);
+
+        return NoContent();
     }
 }

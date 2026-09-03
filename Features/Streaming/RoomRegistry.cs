@@ -1,69 +1,37 @@
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.AspNetCore.WebUtilities;
+
 namespace App.Features.Streaming;
 
 public sealed class RoomRegistry
 {
     private readonly Lock gate = new();
     private readonly Dictionary<string, StreamingRoom> rooms = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Participant> participants = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> viewerRooms = new(StringComparer.Ordinal);
 
-    public CreateRoomResult CreateRoom(string roomId, string connectionId)
+    public bool TryCreateRoom(string roomId, out CreatedRoom? createdRoom)
     {
         lock (gate)
         {
-            if (participants.ContainsKey(connectionId))
-            {
-                return CreateRoomResult.AlreadyInRoom;
-            }
-
             if (rooms.ContainsKey(roomId))
             {
-                return CreateRoomResult.RoomAlreadyExists;
-            }
-
-            rooms.Add(roomId, new StreamingRoom(roomId, connectionId));
-            participants.Add(connectionId, new Participant(roomId, true));
-            return CreateRoomResult.Created;
-        }
-    }
-
-    public JoinRoomResult JoinRoom(string roomId, string connectionId, out string? broadcasterId)
-    {
-        lock (gate)
-        {
-            broadcasterId = null;
-
-            if (participants.ContainsKey(connectionId))
-            {
-                return JoinRoomResult.AlreadyInRoom;
-            }
-
-            if (!rooms.TryGetValue(roomId, out var room))
-            {
-                return JoinRoomResult.RoomNotFound;
-            }
-
-            room.ViewerIds.Add(connectionId);
-            participants.Add(connectionId, new Participant(roomId, false));
-            broadcasterId = room.BroadcasterId;
-            return JoinRoomResult.Joined;
-        }
-    }
-
-    public bool CanRelay(string senderId, string targetId)
-    {
-        lock (gate)
-        {
-            if (!participants.TryGetValue(senderId, out var sender))
-            {
+                createdRoom = null;
                 return false;
             }
 
-            if (!participants.TryGetValue(targetId, out var target))
-            {
-                return false;
-            }
+            var publisherToken = CreateToken();
+            var viewerToken = CreateToken();
 
-            return sender.RoomId == target.RoomId && sender.IsBroadcaster != target.IsBroadcaster;
+            rooms.Add(
+                roomId,
+                new StreamingRoom(
+                    roomId,
+                    HashToken(publisherToken),
+                    HashToken(viewerToken)));
+
+            createdRoom = new CreatedRoom(roomId, publisherToken, viewerToken);
+            return true;
         }
     }
 
@@ -76,71 +44,163 @@ public sealed class RoomRegistry
                 return null;
             }
 
-            return new RoomStatus(room.RoomId, room.ViewerIds.Count, true);
+            return CreateStatus(room);
         }
     }
 
-    public DisconnectionResult? Disconnect(string connectionId)
+    public JoinRoomResult JoinRoom(
+        string roomId,
+        string connectionId,
+        string viewerToken,
+        out RoomStatus? roomStatus)
     {
         lock (gate)
         {
-            if (!participants.Remove(connectionId, out var participant))
+            roomStatus = null;
+
+            if (viewerRooms.ContainsKey(connectionId))
             {
-                return null;
+                return JoinRoomResult.AlreadyInRoom;
             }
 
-            if (!rooms.TryGetValue(participant.RoomId, out var room))
+            if (!rooms.TryGetValue(roomId, out var room))
             {
-                return null;
+                return JoinRoomResult.RoomNotFound;
             }
 
-            if (participant.IsBroadcaster)
+            if (!TokenMatches(viewerToken, room.ViewerTokenHash) &&
+                !TokenMatches(viewerToken, room.PublisherTokenHash))
             {
-                rooms.Remove(participant.RoomId);
-
-                foreach (var viewerId in room.ViewerIds)
-                {
-                    participants.Remove(viewerId);
-                }
-
-                return new DisconnectionResult(participant.RoomId, true, null);
+                return JoinRoomResult.InvalidToken;
             }
 
-            room.ViewerIds.Remove(connectionId);
-            return new DisconnectionResult(participant.RoomId, false, room.BroadcasterId);
+            room.ViewerIds.Add(connectionId);
+            viewerRooms.Add(connectionId, roomId);
+            roomStatus = CreateStatus(room);
+            return JoinRoomResult.Joined;
         }
     }
 
-    private sealed record Participant(string RoomId, bool IsBroadcaster);
+    public ViewerDisconnection? DisconnectViewer(string connectionId)
+    {
+        lock (gate)
+        {
+            if (!viewerRooms.Remove(connectionId, out var roomId))
+            {
+                return null;
+            }
 
-    private sealed class StreamingRoom(string roomId, string broadcasterId)
+            if (!rooms.TryGetValue(roomId, out var room))
+            {
+                return null;
+            }
+
+            room.ViewerIds.Remove(connectionId);
+            return new ViewerDisconnection(roomId, room.ViewerIds.Count);
+        }
+    }
+
+    public bool AuthorizeMedia(string roomId, string action, string token)
+    {
+        lock (gate)
+        {
+            if (!rooms.TryGetValue(roomId, out var room))
+            {
+                return false;
+            }
+
+            if (action == "publish")
+            {
+                return TokenMatches(token, room.PublisherTokenHash);
+            }
+
+            if (action is "read" or "playback")
+            {
+                return TokenMatches(token, room.ViewerTokenHash) ||
+                    TokenMatches(token, room.PublisherTokenHash);
+            }
+
+            return false;
+        }
+    }
+
+    public bool RemoveRoom(string roomId, string publisherToken)
+    {
+        lock (gate)
+        {
+            if (!rooms.TryGetValue(roomId, out var room) ||
+                !TokenMatches(publisherToken, room.PublisherTokenHash))
+            {
+                return false;
+            }
+
+            rooms.Remove(roomId);
+
+            foreach (var viewerId in room.ViewerIds)
+            {
+                viewerRooms.Remove(viewerId);
+            }
+
+            return true;
+        }
+    }
+
+    private static RoomStatus CreateStatus(StreamingRoom room)
+    {
+        return new RoomStatus(room.RoomId, room.ViewerIds.Count, true);
+    }
+
+    private static string CreateToken()
+    {
+        return WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
+    }
+
+    private static byte[] HashToken(string token)
+    {
+        return SHA256.HashData(Encoding.UTF8.GetBytes(token));
+    }
+
+    private static bool TokenMatches(string token, byte[] expectedHash)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return false;
+        }
+
+        var actualHash = HashToken(token);
+        return CryptographicOperations.FixedTimeEquals(actualHash, expectedHash);
+    }
+
+    private sealed class StreamingRoom(
+        string roomId,
+        byte[] publisherTokenHash,
+        byte[] viewerTokenHash)
     {
         public string RoomId { get; } = roomId;
-        public string BroadcasterId { get; } = broadcasterId;
+        public byte[] PublisherTokenHash { get; } = publisherTokenHash;
+        public byte[] ViewerTokenHash { get; } = viewerTokenHash;
         public HashSet<string> ViewerIds { get; } = new(StringComparer.Ordinal);
     }
-}
-
-public enum CreateRoomResult
-{
-    Created,
-    AlreadyInRoom,
-    RoomAlreadyExists
 }
 
 public enum JoinRoomResult
 {
     Joined,
     AlreadyInRoom,
-    RoomNotFound
+    RoomNotFound,
+    InvalidToken
 }
 
-public sealed record DisconnectionResult(
+public sealed record CreatedRoom(
     string RoomId,
-    bool WasBroadcaster,
-    string? BroadcasterId);
+    string PublisherToken,
+    string ViewerToken);
 
 public sealed record RoomStatus(
     string RoomId,
     int ViewerCount,
-    bool IsLive);
+    bool IsCreated);
+
+public sealed record ViewerDisconnection(
+    string RoomId,
+    int ViewerCount);

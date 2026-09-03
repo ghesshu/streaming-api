@@ -38,6 +38,11 @@ public static class Program
             });
 
         builder.Services.AddControllers();
+        builder.Services
+            .AddOptions<MediaMtxOptions>()
+            .BindConfiguration(MediaMtxOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
         builder.Services.AddSingleton<RoomRegistry>();
 
         var app = builder.Build();

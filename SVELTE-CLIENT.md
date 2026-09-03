@@ -1,465 +1,299 @@
-# Connect a Svelte app to the Streaming API
+# Svelte client for C# and MediaMTX
 
-This guide connects a Svelte or SvelteKit browser app to the ASP.NET Core streaming API.
-SignalR transports the room and WebRTC signaling messages. WebRTC transports the actual
-audio and video directly between the broadcaster and viewers.
+The Svelte app talks to two servers:
 
-## 1. Install the client package
+- C# at `http://localhost:3000` for room creation and authorization.
+- MediaMTX at `http://localhost:8889` for WebRTC publishing and viewing.
 
-From the Svelte project directory, install Microsoft's SignalR JavaScript client:
+## Client dependencies
+
+MediaMTX provides standalone browser helpers instead of an npm package. Copy the helper
+files that match the pinned MediaMTX `1.20.1` container into the Svelte project:
+
+```bash
+mkdir -p src/lib/media
+curl -L https://raw.githubusercontent.com/bluenviron/mediamtx/v1.20.1/internal/servers/webrtc/publisher.js -o src/lib/media/publisher.js
+curl -L https://raw.githubusercontent.com/bluenviron/mediamtx/v1.20.1/internal/servers/webrtc/reader.js -o src/lib/media/reader.js
+```
+
+SignalR is optional and is only needed for viewer-count updates:
 
 ```bash
 npm install @microsoft/signalr@10.0.8
 ```
 
-Or use the equivalent command for the project's package manager:
+No SignalR package is required to publish or watch video.
 
-```bash
-pnpm add @microsoft/signalr@10.0.8
-```
+## TypeScript declarations
 
-```bash
-yarn add @microsoft/signalr@10.0.8
-```
-
-No WebRTC package is required. Modern browsers provide `RTCPeerConnection`,
-`RTCSessionDescription`, `RTCIceCandidate`, and `navigator.mediaDevices`.
-
-Version `10.0.8` matches the .NET 10 server in this repository. Keep the SignalR client
-and server on the same major version when upgrading.
-
-## 2. Start the C# API
-
-In the API repository, run:
-
-```bash
-dotnet run
-```
-
-The local endpoints are:
-
-- Health check: `http://localhost:3000/health`
-- Streaming controller: `http://localhost:3000/api/streaming`
-- Room status: `http://localhost:3000/api/streaming/rooms/{roomId}`
-- SignalR hub: `http://localhost:3000/streamingHub`
-
-The controller endpoints are normal HTTP requests. For example, a Svelte app can check
-whether a room is live before joining it:
+Add these declarations to the Svelte project's `src/app.d.ts`:
 
 ```typescript
-async function getRoomStatus(apiUrl: string, roomId: string) {
-    const response = await fetch(
-        `${apiUrl}/api/streaming/rooms/${encodeURIComponent(roomId)}`,
-        { credentials: 'include' }
-    );
-
-    if (response.status === 404) {
-        return null;
-    }
-
-    if (!response.ok) {
-        throw new Error('Could not check the room.');
-    }
-
-    return response.json() as Promise<{
-        roomId: string;
-        viewerCount: number;
-        isLive: boolean;
-    }>;
-}
-```
-
-## 3. Create the SignalR client
-
-Create `src/lib/streamingClient.ts` in the Svelte project:
-
-```typescript
-import {
-    HubConnectionBuilder,
-    HubConnectionState,
-    LogLevel,
-    type HubConnection
-} from '@microsoft/signalr';
-
-type StreamingClientOptions = {
-    apiUrl: string;
-    onLocalStream?: (stream: MediaStream) => void;
-    onRemoteStream?: (stream: MediaStream) => void;
-    onStatus?: (message: string) => void;
+type MediaPublisher = {
+    close: () => void;
 };
 
-type DescriptionMessage = {
-    sender: string;
-    sdp: RTCSessionDescriptionInit;
+type MediaReader = {
+    close: () => void;
 };
 
-type CandidateMessage = {
-    sender: string;
-    candidate: RTCIceCandidateInit;
-};
+declare global {
+    interface Window {
+        MediaMTXWebRTCPublisher: new (options: {
+            url: string;
+            token: string;
+            stream: MediaStream;
+            videoCodec: string;
+            videoBitrate: number;
+            audioCodec: string;
+            audioBitrate: number;
+            audioVoice: boolean;
+            onConnected?: () => void;
+            onError?: (message: string) => void;
+        }) => MediaPublisher;
 
-type ViewerMessage = {
-    viewerId: string;
-};
-
-export class StreamingClient {
-    private readonly connection: HubConnection;
-    private readonly peerConnections = new Map<string, RTCPeerConnection>();
-    private readonly pendingCandidates = new Map<string, RTCIceCandidate[]>();
-    private readonly options: StreamingClientOptions;
-    private readonly iceServers: RTCIceServer[] = [
-        { urls: 'stun:stun.l.google.com:19302' }
-    ];
-
-    private localStream: MediaStream | null = null;
-
-    constructor(options: StreamingClientOptions) {
-        this.options = options;
-        this.connection = new HubConnectionBuilder()
-            .withUrl(`${options.apiUrl}/streamingHub`, {
-                withCredentials: true
-            })
-            .withAutomaticReconnect([0, 2000, 10000, 30000])
-            .configureLogging(LogLevel.Information)
-            .build();
-
-        this.registerEvents();
-    }
-
-    get isConnected(): boolean {
-        return this.connection.state === HubConnectionState.Connected;
-    }
-
-    async connect(): Promise<void> {
-        if (this.connection.state !== HubConnectionState.Disconnected) {
-            return;
-        }
-
-        await this.connection.start();
-        this.options.onStatus?.('Connected to streaming API');
-    }
-
-    async startBroadcast(roomId: string): Promise<void> {
-        this.ensureConnected();
-
-        this.localStream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: true
-        });
-
-        this.options.onLocalStream?.(this.localStream);
-        await this.connection.invoke('create-room', roomId);
-    }
-
-    async joinRoom(roomId: string): Promise<void> {
-        this.ensureConnected();
-        await this.connection.invoke('join-room', roomId);
-    }
-
-    async dispose(): Promise<void> {
-        this.localStream?.getTracks().forEach(track => track.stop());
-        this.localStream = null;
-
-        for (const peerId of this.peerConnections.keys()) {
-            this.closePeer(peerId);
-        }
-
-        if (this.connection.state !== HubConnectionState.Disconnected) {
-            await this.connection.stop();
-        }
-    }
-
-    private registerEvents(): void {
-        this.connection.on('room-created', (message: { roomId: string }) => {
-            this.options.onStatus?.(`Broadcasting room ${message.roomId}`);
-        });
-
-        this.connection.on(
-            'joined-room',
-            (message: { roomId: string; broadcasterId: string }) => {
-                this.options.onStatus?.(`Joined room ${message.roomId}`);
-            }
-        );
-
-        this.connection.on('viewer-joined', async (message: ViewerMessage) => {
-            if (!this.localStream) {
-                return;
-            }
-
-            const peerConnection = this.createPeerConnection(message.viewerId);
-
-            for (const track of this.localStream.getTracks()) {
-                peerConnection.addTrack(track, this.localStream);
-            }
-
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
-
-            await this.connection.invoke('offer', {
-                target: message.viewerId,
-                sdp: offer
-            });
-        });
-
-        this.connection.on('offer', async (message: DescriptionMessage) => {
-            const peerConnection = this.createPeerConnection(message.sender);
-            await peerConnection.setRemoteDescription(message.sdp);
-            await this.addPendingCandidates(message.sender, peerConnection);
-
-            const answer = await peerConnection.createAnswer();
-            await peerConnection.setLocalDescription(answer);
-
-            await this.connection.invoke('answer', {
-                target: message.sender,
-                sdp: answer
-            });
-        });
-
-        this.connection.on('answer', async (message: DescriptionMessage) => {
-            const peerConnection = this.peerConnections.get(message.sender);
-
-            if (!peerConnection) {
-                return;
-            }
-
-            await peerConnection.setRemoteDescription(message.sdp);
-            await this.addPendingCandidates(message.sender, peerConnection);
-        });
-
-        this.connection.on('ice-candidate', async (message: CandidateMessage) => {
-            const candidate = new RTCIceCandidate(message.candidate);
-            const peerConnection = this.peerConnections.get(message.sender);
-
-            if (!peerConnection || !peerConnection.remoteDescription) {
-                const candidates = this.pendingCandidates.get(message.sender) ?? [];
-                candidates.push(candidate);
-                this.pendingCandidates.set(message.sender, candidates);
-                return;
-            }
-
-            await peerConnection.addIceCandidate(candidate);
-        });
-
-        this.connection.on('viewer-left', (message: ViewerMessage) => {
-            this.closePeer(message.viewerId);
-        });
-
-        this.connection.on('broadcaster-left', () => {
-            for (const peerId of this.peerConnections.keys()) {
-                this.closePeer(peerId);
-            }
-
-            this.options.onStatus?.('The broadcaster ended the stream');
-        });
-
-        this.connection.on('streaming-error', (message: string) => {
-            this.options.onStatus?.(message);
-        });
-
-        this.connection.onreconnecting(() => {
-            this.options.onStatus?.('Reconnecting to streaming API');
-        });
-
-        this.connection.onreconnected(() => {
-            this.options.onStatus?.('Reconnected; create or join the room again');
-        });
-
-        this.connection.onclose(() => {
-            this.options.onStatus?.('Disconnected from streaming API');
-        });
-    }
-
-    private createPeerConnection(peerId: string): RTCPeerConnection {
-        const existingConnection = this.peerConnections.get(peerId);
-
-        if (existingConnection) {
-            return existingConnection;
-        }
-
-        const peerConnection = new RTCPeerConnection({
-            iceServers: this.iceServers
-        });
-
-        peerConnection.onicecandidate = async event => {
-            if (!event.candidate) {
-                return;
-            }
-
-            await this.connection.invoke('ice-candidate', {
-                target: peerId,
-                candidate: event.candidate.toJSON()
-            });
-        };
-
-        peerConnection.ontrack = event => {
-            const remoteStream = event.streams[0];
-
-            if (remoteStream) {
-                this.options.onRemoteStream?.(remoteStream);
-            }
-        };
-
-        peerConnection.onconnectionstatechange = () => {
-            if (['failed', 'closed'].includes(peerConnection.connectionState)) {
-                this.closePeer(peerId);
-            }
-        };
-
-        this.peerConnections.set(peerId, peerConnection);
-        return peerConnection;
-    }
-
-    private async addPendingCandidates(
-        peerId: string,
-        peerConnection: RTCPeerConnection
-    ): Promise<void> {
-        const candidates = this.pendingCandidates.get(peerId) ?? [];
-
-        for (const candidate of candidates) {
-            await peerConnection.addIceCandidate(candidate);
-        }
-
-        this.pendingCandidates.delete(peerId);
-    }
-
-    private closePeer(peerId: string): void {
-        this.peerConnections.get(peerId)?.close();
-        this.peerConnections.delete(peerId);
-        this.pendingCandidates.delete(peerId);
-    }
-
-    private ensureConnected(): void {
-        if (!this.isConnected) {
-            throw new Error('Connect to the streaming API first.');
-        }
+        MediaMTXWebRTCReader: new (options: {
+            url: string;
+            token: string;
+            onTrack: (event: RTCTrackEvent) => void;
+            onError?: (message: string) => void;
+        }) => MediaReader;
     }
 }
+
+export {};
 ```
 
-## 4. Use it from a Svelte component
+## Broadcaster example
 
-Create a component such as `src/lib/StreamingRoom.svelte`:
+Create `Broadcaster.svelte`:
 
 ```svelte
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { StreamingClient } from './streamingClient';
+
+    type Room = {
+        roomId: string;
+        publisherToken: string;
+        viewerToken: string;
+        publishUrl: string;
+        watchUrl: string;
+        sharePath: string;
+    };
 
     let roomId = 'demo-room';
-    let status = 'Connecting';
+    let status = 'Ready';
+    let shareUrl = '';
     let videoElement: HTMLVideoElement;
-    let client: StreamingClient;
+    let room: Room | null = null;
+    let localStream: MediaStream | null = null;
+    let publisher: MediaPublisher | null = null;
 
     onMount(() => {
-        client = new StreamingClient({
-            apiUrl: 'http://localhost:3000',
-            onLocalStream: stream => {
-                videoElement.srcObject = stream;
-                videoElement.muted = true;
-            },
-            onRemoteStream: stream => {
-                videoElement.srcObject = stream;
-                videoElement.muted = false;
-            },
-            onStatus: message => {
-                status = message;
-            }
-        });
-
-        client.connect().catch(error => {
-            status = error instanceof Error ? error.message : 'Connection failed';
-        });
+        void import('$lib/media/publisher.js');
 
         return () => {
-            void client.dispose();
+            publisher?.close();
+            localStream?.getTracks().forEach(track => track.stop());
         };
     });
 
     async function startBroadcast() {
         try {
-            await client.startBroadcast(roomId);
+            status = 'Requesting camera';
+
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true
+            });
+
+            videoElement.srcObject = localStream;
+
+            const response = await fetch(
+                'http://localhost:3000/api/streaming/rooms',
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ roomId })
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+
+            room = await response.json();
+            shareUrl = `${window.location.origin}${room.sharePath}`;
+
+            publisher = new window.MediaMTXWebRTCPublisher({
+                url: room.publishUrl,
+                token: room.publisherToken,
+                stream: localStream,
+                videoCodec: 'vp8/90000',
+                videoBitrate: 2500,
+                audioCodec: 'opus/48000',
+                audioBitrate: 32,
+                audioVoice: true,
+                onConnected: () => {
+                    status = 'Live';
+                },
+                onError: message => {
+                    status = message;
+                }
+            });
         } catch (error) {
-            status = error instanceof Error ? error.message : 'Could not broadcast';
+            status = error instanceof Error ? error.message : 'Could not start';
         }
     }
 
-    async function joinRoom() {
-        try {
-            await client.joinRoom(roomId);
-        } catch (error) {
-            status = error instanceof Error ? error.message : 'Could not join room';
+    async function stopBroadcast() {
+        publisher?.close();
+        publisher = null;
+
+        localStream?.getTracks().forEach(track => track.stop());
+        localStream = null;
+
+        if (room) {
+            await fetch(
+                `http://localhost:3000/api/streaming/rooms/${room.roomId}`,
+                {
+                    method: 'DELETE',
+                    headers: {
+                        'X-Publisher-Token': room.publisherToken
+                    }
+                }
+            );
         }
+
+        room = null;
+        status = 'Stopped';
     }
 </script>
 
-<label for="roomId">Room ID</label>
-<input id="roomId" bind:value={roomId} />
+<input bind:value={roomId} aria-label="Room ID" />
+<button onclick={startBroadcast}>Go live</button>
+<button onclick={stopBroadcast}>Stop</button>
 
-<button type="button" onclick={startBroadcast}>Start broadcast</button>
-<button type="button" onclick={joinRoom}>Join room</button>
+<p>{status}</p>
+
+{#if shareUrl}
+    <p>Share this link: {shareUrl}</p>
+{/if}
+
+<video bind:this={videoElement} autoplay playsinline muted></video>
+```
+
+The browser sends one WHIP stream to MediaMTX. It does not create a separate peer
+connection for every viewer.
+
+## Viewer example
+
+Create `Viewer.svelte`:
+
+```svelte
+<script lang="ts">
+    import { onMount } from 'svelte';
+
+    export let roomId: string;
+    export let viewerToken: string;
+
+    let status = 'Connecting';
+    let videoElement: HTMLVideoElement;
+    let reader: MediaReader | null = null;
+
+    onMount(() => {
+        async function watch() {
+            await import('$lib/media/reader.js');
+
+            reader = new window.MediaMTXWebRTCReader({
+                url: `http://localhost:8889/${roomId}/whep`,
+                token: viewerToken,
+                onTrack: event => {
+                    const stream = event.streams[0];
+
+                    if (stream) {
+                        videoElement.srcObject = stream;
+                        status = 'Watching live';
+                    }
+                },
+                onError: message => {
+                    status = message;
+                }
+            });
+        }
+
+        void watch();
+
+        return () => {
+            reader?.close();
+        };
+    });
+</script>
 
 <p>{status}</p>
 <video bind:this={videoElement} autoplay playsinline controls></video>
 ```
 
-For SvelteKit, keep client construction inside `onMount` as shown. WebRTC and browser
-media APIs are unavailable during server-side rendering.
+## Shareable SvelteKit route
 
-## SignalR event contract
+Create `src/routes/watch/[roomId]/+page.svelte`:
 
-The Svelte client invokes these server methods:
+```svelte
+<script lang="ts">
+    import { onMount } from 'svelte';
+    import { page } from '$app/state';
+    import Viewer from '$lib/Viewer.svelte';
 
-| Method | Payload |
-| --- | --- |
-| `create-room` | A room ID string |
-| `join-room` | A room ID string |
-| `offer` | `{ target, sdp }` |
-| `answer` | `{ target, sdp }` |
-| `ice-candidate` | `{ target, candidate }` |
+    const roomId = page.params.roomId;
+    let viewerToken = '';
 
-The Svelte client listens for these server events:
+    onMount(() => {
+        const values = new URLSearchParams(window.location.hash.slice(1));
+        viewerToken = values.get('token') ?? '';
+    });
+</script>
 
-| Event | Payload |
-| --- | --- |
-| `room-created` | `{ roomId }` |
-| `joined-room` | `{ roomId, broadcasterId }` |
-| `viewer-joined` | `{ viewerId }` |
-| `viewer-left` | `{ viewerId }` |
-| `offer` | `{ sender, sdp }` |
-| `answer` | `{ sender, sdp }` |
-| `ice-candidate` | `{ sender, candidate }` |
-| `broadcaster-left` | No payload |
-| `streaming-error` | Error message string |
-
-## CORS configuration
-
-The API currently accepts every origin for development. Before production, replace the
-wildcard in the API's `appsettings.json` with the real Svelte application origins:
-
-```json
-{
-  "Cors": {
-    "AllowedOrigins": [
-      "http://localhost:5173",
-      "https://stream.example.com"
-    ]
-  }
-}
+{#if viewerToken}
+    <Viewer {roomId} {viewerToken} />
+{:else}
+    <p>This viewing link is missing its token.</p>
+{/if}
 ```
 
-Restart the C# API after changing this configuration.
+The API returns a share path like:
 
-## Production requirements
+```text
+/watch/demo-room#token=viewer-token
+```
 
-- Serve both applications over HTTPS. Browsers only allow camera and microphone access
-  from secure origins, with localhost as the development exception.
-- Replace the example public STUN server with your own STUN and TURN configuration.
-  TURN is required for users whose networks cannot establish a direct peer connection.
-- Protect `create-room` and `join-room` with authentication before allowing public use.
-- The current peer-to-peer design creates one broadcaster upload per viewer. Use an SFU
-  when broadcasts need a large audience.
-- Room membership is tied to a SignalR connection ID. After a reconnect, the client must
-  create or join its room again.
+## Optional viewer count
 
-See Microsoft's [SignalR JavaScript client documentation](https://learn.microsoft.com/en-us/aspnet/core/signalr/javascript-client?view=aspnetcore-10.0)
-for additional connection, logging, transport, and reconnection options.
+Install `@microsoft/signalr`, connect to `http://localhost:3000/streamingHub`, and then:
+
+```typescript
+connection.on('viewer-count-changed', room => {
+    console.log(room.viewerCount);
+});
+
+connection.on('room-ended', () => {
+    console.log('The broadcaster ended this room.');
+});
+
+await connection.start();
+await connection.invoke('join-room', roomId, viewerToken);
+```
+
+SignalR is not involved in the audio/video connection.
+
+## Production checklist
+
+- Replace every localhost URL with the deployed API and MediaMTX addresses.
+- Use HTTPS for camera access and WHIP/WHEP negotiation.
+- Put the public MediaMTX hostname in `webrtcAdditionalHosts`.
+- Configure a TURN server if UDP port `8189` cannot be reached.
+- Never expose the publisher token in the viewer link.
+- Keep the viewer token in the URL fragment or authenticated application state.
+
+The helper classes come from MediaMTX's official
+[publisher.js](https://github.com/bluenviron/mediamtx/blob/v1.20.1/internal/servers/webrtc/publisher.js)
+and [reader.js](https://github.com/bluenviron/mediamtx/blob/v1.20.1/internal/servers/webrtc/reader.js).
