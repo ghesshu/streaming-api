@@ -14,7 +14,4 @@ public sealed class MediaMtxOptions
     [Url]
     public string HlsBaseUrl { get; init; } = "http://localhost:8888";
 
-    [Required]
-    [MinLength(16)]
-    public string AuthCallbackKey { get; init; } = string.Empty;
 }

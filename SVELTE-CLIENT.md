@@ -1,14 +1,14 @@
-# Svelte client for C# and MediaMTX
+# Token-free Svelte streaming client
 
-The Svelte app talks to two servers:
+The Svelte app uses:
 
-- C# at `http://localhost:3000` for room creation and authorization.
-- MediaMTX at `http://localhost:8889` for WebRTC publishing and viewing.
+- C# at `http://localhost:3000` to create and track rooms.
+- MediaMTX at `http://localhost:8889` to publish and watch streams.
+- SignalR optionally for viewer-count updates.
 
-## Client dependencies
+No publisher or viewer credentials are required.
 
-MediaMTX provides standalone browser helpers instead of an npm package. Copy the helper
-files that match the pinned MediaMTX `1.20.1` container into the Svelte project:
+## Add the MediaMTX browser helpers
 
 ```bash
 mkdir -p src/lib/media
@@ -16,57 +16,13 @@ curl -L https://raw.githubusercontent.com/bluenviron/mediamtx/v1.20.1/internal/s
 curl -L https://raw.githubusercontent.com/bluenviron/mediamtx/v1.20.1/internal/servers/webrtc/reader.js -o src/lib/media/reader.js
 ```
 
-SignalR is optional and is only needed for viewer-count updates:
+SignalR is optional:
 
 ```bash
 npm install @microsoft/signalr@10.0.8
 ```
 
-No SignalR package is required to publish or watch video.
-
-## TypeScript declarations
-
-Add these declarations to the Svelte project's `src/app.d.ts`:
-
-```typescript
-type MediaPublisher = {
-    close: () => void;
-};
-
-type MediaReader = {
-    close: () => void;
-};
-
-declare global {
-    interface Window {
-        MediaMTXWebRTCPublisher: new (options: {
-            url: string;
-            token: string;
-            stream: MediaStream;
-            videoCodec: string;
-            videoBitrate: number;
-            audioCodec: string;
-            audioBitrate: number;
-            audioVoice: boolean;
-            onConnected?: () => void;
-            onError?: (message: string) => void;
-        }) => MediaPublisher;
-
-        MediaMTXWebRTCReader: new (options: {
-            url: string;
-            token: string;
-            onTrack: (event: RTCTrackEvent) => void;
-            onError?: (message: string) => void;
-        }) => MediaReader;
-    }
-}
-
-export {};
-```
-
 ## Broadcaster example
-
-Create `Broadcaster.svelte`:
 
 ```svelte
 <script lang="ts">
@@ -74,23 +30,41 @@ Create `Broadcaster.svelte`:
 
     type Room = {
         roomId: string;
-        publisherToken: string;
-        viewerToken: string;
         publishUrl: string;
         watchUrl: string;
+        hlsUrl: string;
         sharePath: string;
+    };
+
+    type MediaPublisher = {
+        close: () => void;
+    };
+
+    type MediaWindow = Window & {
+        MediaMTXWebRTCPublisher: new (options: {
+            url: string;
+            stream: MediaStream;
+            videoCodec: string;
+            videoBitrate: number;
+            audioCodec: string;
+            audioBitrate: number;
+            audioVoice: boolean;
+            onConnected: () => void;
+            onError: (message: string) => void;
+        }) => MediaPublisher;
     };
 
     let roomId = 'demo-room';
     let status = 'Ready';
     let shareUrl = '';
     let videoElement: HTMLVideoElement;
-    let room: Room | null = null;
-    let localStream: MediaStream | null = null;
     let publisher: MediaPublisher | null = null;
+    let localStream: MediaStream | null = null;
+    let room: Room | null = null;
+    let publisherReady: Promise<unknown> | null = null;
 
     onMount(() => {
-        void import('$lib/media/publisher.js');
+        publisherReady = import('$lib/media/publisher.js');
 
         return () => {
             publisher?.close();
@@ -99,51 +73,49 @@ Create `Broadcaster.svelte`:
     });
 
     async function startBroadcast() {
-        try {
-            status = 'Requesting camera';
+        await publisherReady;
 
-            localStream = await navigator.mediaDevices.getUserMedia({
-                video: true,
-                audio: true
-            });
+        localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+        });
 
-            videoElement.srcObject = localStream;
+        videoElement.srcObject = localStream;
 
-            const response = await fetch(
-                'http://localhost:3000/api/streaming/rooms',
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ roomId })
-                }
-            );
-
-            if (!response.ok) {
-                throw new Error(await response.text());
+        const response = await fetch(
+            'http://localhost:3000/api/streaming/rooms',
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ roomId })
             }
+        );
 
-            room = await response.json();
-            shareUrl = `${window.location.origin}${room.sharePath}`;
-
-            publisher = new window.MediaMTXWebRTCPublisher({
-                url: room.publishUrl,
-                token: room.publisherToken,
-                stream: localStream,
-                videoCodec: 'vp8/90000',
-                videoBitrate: 2500,
-                audioCodec: 'opus/48000',
-                audioBitrate: 32,
-                audioVoice: true,
-                onConnected: () => {
-                    status = 'Live';
-                },
-                onError: message => {
-                    status = message;
-                }
-            });
-        } catch (error) {
-            status = error instanceof Error ? error.message : 'Could not start';
+        if (!response.ok) {
+            status = await response.text();
+            return;
         }
+
+        room = await response.json();
+        shareUrl = `${window.location.origin}${room.sharePath}`;
+
+        const mediaWindow = window as MediaWindow;
+
+        publisher = new mediaWindow.MediaMTXWebRTCPublisher({
+            url: room.publishUrl,
+            stream: localStream,
+            videoCodec: 'vp8/90000',
+            videoBitrate: 2500,
+            audioCodec: 'opus/48000',
+            audioBitrate: 32,
+            audioVoice: true,
+            onConnected: () => {
+                status = 'Live';
+            },
+            onError: message => {
+                status = message;
+            }
+        });
     }
 
     async function stopBroadcast() {
@@ -156,12 +128,7 @@ Create `Broadcaster.svelte`:
         if (room) {
             await fetch(
                 `http://localhost:3000/api/streaming/rooms/${room.roomId}`,
-                {
-                    method: 'DELETE',
-                    headers: {
-                        'X-Publisher-Token': room.publisherToken
-                    }
-                }
+                { method: 'DELETE' }
             );
         }
 
@@ -175,125 +142,39 @@ Create `Broadcaster.svelte`:
 <button onclick={stopBroadcast}>Stop</button>
 
 <p>{status}</p>
-
-{#if shareUrl}
-    <p>Share this link: {shareUrl}</p>
-{/if}
-
+{#if shareUrl}<p>Share: {shareUrl}</p>{/if}
 <video bind:this={videoElement} autoplay playsinline muted></video>
 ```
 
-The browser sends one WHIP stream to MediaMTX. It does not create a separate peer
-connection for every viewer.
-
 ## Viewer example
 
-Create `Viewer.svelte`:
-
-```svelte
-<script lang="ts">
-    import { onMount } from 'svelte';
-
-    export let roomId: string;
-    export let viewerToken: string;
-
-    let status = 'Connecting';
-    let videoElement: HTMLVideoElement;
-    let reader: MediaReader | null = null;
-
-    onMount(() => {
-        async function watch() {
-            await import('$lib/media/reader.js');
-
-            reader = new window.MediaMTXWebRTCReader({
-                url: `http://localhost:8889/${roomId}/whep`,
-                token: viewerToken,
-                onTrack: event => {
-                    const stream = event.streams[0];
-
-                    if (stream) {
-                        videoElement.srcObject = stream;
-                        status = 'Watching live';
-                    }
-                },
-                onError: message => {
-                    status = message;
-                }
-            });
-        }
-
-        void watch();
-
-        return () => {
-            reader?.close();
-        };
-    });
-</script>
-
-<p>{status}</p>
-<video bind:this={videoElement} autoplay playsinline controls></video>
-```
-
-## Shareable SvelteKit route
-
-Create `src/routes/watch/[roomId]/+page.svelte`:
-
-```svelte
-<script lang="ts">
-    import { onMount } from 'svelte';
-    import { page } from '$app/state';
-    import Viewer from '$lib/Viewer.svelte';
-
-    const roomId = page.params.roomId;
-    let viewerToken = '';
-
-    onMount(() => {
-        const values = new URLSearchParams(window.location.hash.slice(1));
-        viewerToken = values.get('token') ?? '';
-    });
-</script>
-
-{#if viewerToken}
-    <Viewer {roomId} {viewerToken} />
-{:else}
-    <p>This viewing link is missing its token.</p>
-{/if}
-```
-
-The API returns a share path like:
+See [FRONTEND-VIEWER.md](FRONTEND-VIEWER.md) for the complete viewer route. It opens:
 
 ```text
-/watch/demo-room#token=viewer-token
+http://localhost:8889/{roomId}/whep
 ```
+
+without an authorization header.
 
 ## Optional viewer count
 
-Install `@microsoft/signalr`, connect to `http://localhost:3000/streamingHub`, and then:
-
 ```typescript
+import { HubConnectionBuilder } from '@microsoft/signalr';
+
+const connection = new HubConnectionBuilder()
+    .withUrl('http://localhost:3000/streamingHub')
+    .withAutomaticReconnect()
+    .build();
+
 connection.on('viewer-count-changed', room => {
     console.log(room.viewerCount);
 });
 
-connection.on('room-ended', () => {
-    console.log('The broadcaster ended this room.');
-});
-
 await connection.start();
-await connection.invoke('join-room', roomId, viewerToken);
+await connection.invoke('join-room', roomId);
 ```
 
-SignalR is not involved in the audio/video connection.
+## Security warning
 
-## Production checklist
-
-- Replace every localhost URL with the deployed API and MediaMTX addresses.
-- Use HTTPS for camera access and WHIP/WHEP negotiation.
-- Put the public MediaMTX hostname in `webrtcAdditionalHosts`.
-- Configure a TURN server if UDP port `8189` cannot be reached.
-- Never expose the publisher token in the viewer link.
-- Keep the viewer token in the URL fragment or authenticated application state.
-
-The helper classes come from MediaMTX's official
-[publisher.js](https://github.com/bluenviron/mediamtx/blob/v1.20.1/internal/servers/webrtc/publisher.js)
-and [reader.js](https://github.com/bluenviron/mediamtx/blob/v1.20.1/internal/servers/webrtc/reader.js).
+In this configuration, anyone who knows or guesses a room ID can publish, watch, join
+presence, or delete the room. Add authentication before using it for private streams.

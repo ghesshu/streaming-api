@@ -2,7 +2,7 @@
 
 This project is the control API for a one-to-many live-streaming platform.
 
-- ASP.NET Core creates rooms, issues access tokens, and authorizes media access.
+- ASP.NET Core creates rooms and tells MediaMTX whether a room exists.
 - MediaMTX receives one stream from the broadcaster and distributes it to viewers.
 - SignalR is used only for optional presence updates such as viewer counts.
 - Svelte owns the recording and viewing interfaces.
@@ -48,25 +48,23 @@ Example response:
 ```json
 {
   "roomId": "demo-room",
-  "publisherToken": "secret-publisher-token",
-  "viewerToken": "shareable-viewer-token",
   "publishUrl": "http://localhost:8889/demo-room/whip",
   "watchUrl": "http://localhost:8889/demo-room/whep",
   "hlsUrl": "http://localhost:8888/demo-room/index.m3u8",
-  "sharePath": "/watch/demo-room#token=shareable-viewer-token"
+  "sharePath": "/watch/demo-room"
 }
 ```
 
-The raw tokens are returned only when the room is created. The registry keeps SHA-256
-hashes instead of the raw values.
+There are no publisher or viewer tokens. Anyone who knows the room ID can publish,
+watch, join presence, or delete that room.
 
 ## Room endpoints
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/streaming/rooms` | Create a room and its tokens |
+| `POST` | `/api/streaming/rooms` | Create a room |
 | `GET` | `/api/streaming/rooms/{roomId}` | Read room metadata and viewer count |
-| `DELETE` | `/api/streaming/rooms/{roomId}` | Delete a room using `X-Publisher-Token` |
+| `DELETE` | `/api/streaming/rooms/{roomId}` | Delete a room |
 | `GET` | `/api/streaming` | Describe the service |
 | `GET` | `/health` | API health check |
 
@@ -75,7 +73,7 @@ MediaMTX requests but does not forcibly terminate a media session already in pro
 
 ## Media authorization
 
-MediaMTX sends every `publish`, `read`, and `playback` authorization request to:
+MediaMTX sends every `publish`, `read`, and `playback` request to:
 
 ```text
 POST /api/media-auth
@@ -83,23 +81,16 @@ POST /api/media-auth
 
 This is an internal callback, not a frontend endpoint.
 
-- The publisher token can publish and read its room.
-- The viewer token can only read its room.
-- Tokens cannot access a different room.
-- Unknown rooms and invalid tokens receive HTTP 401.
-
-WHIP and WHEP clients send the token with:
-
-```http
-Authorization: Bearer token-value
-```
+- Publishing, reading, and playback are allowed when the room exists.
+- Unknown rooms receive HTTP 401.
+- No credentials or authorization headers are required.
 
 ## SignalR presence
 
 Connect to `/streamingHub`, then register a viewer with:
 
 ```typescript
-await connection.invoke('join-room', roomId, viewerToken);
+await connection.invoke('join-room', roomId);
 ```
 
 Listen for:
@@ -127,13 +118,14 @@ current example configuration.
 
 ## Important production changes
 
-- Replace `local-media-auth-key` in both `appsettings.json` and `mediamtx.yml`.
 - Replace wildcard CORS origins in both services with the Svelte application's origin.
 - Replace `127.0.0.1` in `webrtcAdditionalHosts` with the server's public IP or DNS name.
 - Serve the API, Svelte app, and MediaMTX handshake endpoints over HTTPS.
 - Configure TURN when clients cannot reach MediaMTX UDP port `8189` directly.
 - Replace the in-memory `RoomRegistry` with a shared persistent store before running
   multiple API instances. No database migration is included or run by this project.
+- Add application authentication before using this configuration for private or
+  untrusted streaming. In the current design, the room ID is the only barrier.
 
 See [FRONTEND-VIEWER.md](FRONTEND-VIEWER.md) for the simplest viewing example,
 [SVELTE-CLIENT.md](SVELTE-CLIENT.md) for complete browser integration, and

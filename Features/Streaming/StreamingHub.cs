@@ -7,14 +7,13 @@ public sealed class StreamingHub(
     ILogger<StreamingHub> logger) : Hub
 {
     [HubMethodName("join-room")]
-    public async Task JoinRoom(string roomId, string viewerToken)
+    public async Task JoinRoom(string roomId)
     {
         roomId = roomId?.Trim() ?? string.Empty;
 
         var result = roomRegistry.JoinRoom(
             roomId,
             Context.ConnectionId,
-            viewerToken,
             out var roomStatus);
 
         if (result == JoinRoomResult.AlreadyInRoom)
@@ -29,9 +28,9 @@ public sealed class StreamingHub(
             return;
         }
 
-        if (result == JoinRoomResult.InvalidToken || roomStatus is null)
+        if (roomStatus is null)
         {
-            await SendError("The viewer token is invalid.");
+            await SendError("Room could not be joined.");
             return;
         }
 

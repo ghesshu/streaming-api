@@ -1,7 +1,3 @@
-using System.Security.Cryptography;
-using System.Text;
-using Microsoft.AspNetCore.WebUtilities;
-
 namespace App.Features.Streaming;
 
 public sealed class RoomRegistry
@@ -20,17 +16,8 @@ public sealed class RoomRegistry
                 return false;
             }
 
-            var publisherToken = CreateToken();
-            var viewerToken = CreateToken();
-
-            rooms.Add(
-                roomId,
-                new StreamingRoom(
-                    roomId,
-                    HashToken(publisherToken),
-                    HashToken(viewerToken)));
-
-            createdRoom = new CreatedRoom(roomId, publisherToken, viewerToken);
+            rooms.Add(roomId, new StreamingRoom(roomId));
+            createdRoom = new CreatedRoom(roomId);
             return true;
         }
     }
@@ -51,7 +38,6 @@ public sealed class RoomRegistry
     public JoinRoomResult JoinRoom(
         string roomId,
         string connectionId,
-        string viewerToken,
         out RoomStatus? roomStatus)
     {
         lock (gate)
@@ -66,12 +52,6 @@ public sealed class RoomRegistry
             if (!rooms.TryGetValue(roomId, out var room))
             {
                 return JoinRoomResult.RoomNotFound;
-            }
-
-            if (!TokenMatches(viewerToken, room.ViewerTokenHash) &&
-                !TokenMatches(viewerToken, room.PublisherTokenHash))
-            {
-                return JoinRoomResult.InvalidToken;
             }
 
             room.ViewerIds.Add(connectionId);
@@ -100,41 +80,27 @@ public sealed class RoomRegistry
         }
     }
 
-    public bool AuthorizeMedia(string roomId, string action, string token)
+    public bool AuthorizeMedia(string roomId, string action)
     {
         lock (gate)
         {
-            if (!rooms.TryGetValue(roomId, out var room))
+            if (!rooms.ContainsKey(roomId))
             {
                 return false;
             }
 
-            if (action == "publish")
-            {
-                return TokenMatches(token, room.PublisherTokenHash);
-            }
-
-            if (action is "read" or "playback")
-            {
-                return TokenMatches(token, room.ViewerTokenHash) ||
-                    TokenMatches(token, room.PublisherTokenHash);
-            }
-
-            return false;
+            return action is "publish" or "read" or "playback";
         }
     }
 
-    public bool RemoveRoom(string roomId, string publisherToken)
+    public bool RemoveRoom(string roomId)
     {
         lock (gate)
         {
-            if (!rooms.TryGetValue(roomId, out var room) ||
-                !TokenMatches(publisherToken, room.PublisherTokenHash))
+            if (!rooms.Remove(roomId, out var room))
             {
                 return false;
             }
-
-            rooms.Remove(roomId);
 
             foreach (var viewerId in room.ViewerIds)
             {
@@ -150,35 +116,9 @@ public sealed class RoomRegistry
         return new RoomStatus(room.RoomId, room.ViewerIds.Count, true);
     }
 
-    private static string CreateToken()
-    {
-        return WebEncoders.Base64UrlEncode(RandomNumberGenerator.GetBytes(32));
-    }
-
-    private static byte[] HashToken(string token)
-    {
-        return SHA256.HashData(Encoding.UTF8.GetBytes(token));
-    }
-
-    private static bool TokenMatches(string token, byte[] expectedHash)
-    {
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            return false;
-        }
-
-        var actualHash = HashToken(token);
-        return CryptographicOperations.FixedTimeEquals(actualHash, expectedHash);
-    }
-
-    private sealed class StreamingRoom(
-        string roomId,
-        byte[] publisherTokenHash,
-        byte[] viewerTokenHash)
+    private sealed class StreamingRoom(string roomId)
     {
         public string RoomId { get; } = roomId;
-        public byte[] PublisherTokenHash { get; } = publisherTokenHash;
-        public byte[] ViewerTokenHash { get; } = viewerTokenHash;
         public HashSet<string> ViewerIds { get; } = new(StringComparer.Ordinal);
     }
 }
@@ -187,14 +127,10 @@ public enum JoinRoomResult
 {
     Joined,
     AlreadyInRoom,
-    RoomNotFound,
-    InvalidToken
+    RoomNotFound
 }
 
-public sealed record CreatedRoom(
-    string RoomId,
-    string PublisherToken,
-    string ViewerToken);
+public sealed record CreatedRoom(string RoomId);
 
 public sealed record RoomStatus(
     string RoomId,

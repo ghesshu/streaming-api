@@ -1,8 +1,8 @@
 logLevel: info
 
-# MediaMTX delegates every publish/read decision to the C# API.
+# MediaMTX asks C# whether the requested room exists.
 authMethod: http
-authHTTPAddress: http://api:3000/api/media-auth?key=local-media-auth-key
+authHTTPAddress: http://api:3000/api/media-auth
 authHTTPExclude:
   - action: api
   - action: metrics

@@ -59,12 +59,10 @@ public sealed class StreamingController(
 
         var response = new CreateRoomResponse(
             createdRoom.RoomId,
-            createdRoom.PublisherToken,
-            createdRoom.ViewerToken,
             $"{webRtcBaseUrl}/{createdRoom.RoomId}/whip",
             $"{webRtcBaseUrl}/{createdRoom.RoomId}/whep",
             $"{hlsBaseUrl}/{createdRoom.RoomId}/index.m3u8",
-            $"/watch/{createdRoom.RoomId}#token={createdRoom.ViewerToken}");
+            $"/watch/{createdRoom.RoomId}");
 
         return CreatedAtAction(
             nameof(GetRoom),
@@ -89,15 +87,13 @@ public sealed class StreamingController(
     }
 
     [HttpDelete("rooms/{roomId}")]
-    public async Task<IActionResult> DeleteRoom(
-        string roomId,
-        [FromHeader(Name = "X-Publisher-Token")] string publisherToken)
+    public async Task<IActionResult> DeleteRoom(string roomId)
     {
-        if (!roomRegistry.RemoveRoom(roomId, publisherToken))
+        if (!roomRegistry.RemoveRoom(roomId))
         {
-            return Unauthorized(new
+            return NotFound(new
             {
-                message = "The room does not exist or the publisher token is invalid."
+                message = "Room does not exist."
             });
         }
 
